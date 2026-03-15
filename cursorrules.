@@ -1,0 +1,374 @@
+# .cursorrules —  Wealth & Card Tracking System
+
+> This file is the single source of truth for all AI-assisted development.
+> Read it fully before generating any code. When in doubt, re-read it.
+
+---
+
+## 1. Project Overview
+
+A **privacy-first**, single-user personal finance dashboard for tracking:
+- Multi-currency bank accounts and credit card balances
+- Investment holdings (stocks, crypto) with real-time market value
+- Credit card reward points / cashback with a dynamic rule engine
+- Net worth across all asset and liability accounts
+
+**Core design principle**: Two tables (`accounts` + `transactions`) model every
+financial entity and every money/points movement in the system.
+
+---
+
+## 2. Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Framework | Next.js 14 (App Router) |
+| Language | TypeScript — strict mode, no `any` |
+| Database / Auth | Supabase (PostgreSQL) |
+| UI Components | shadcn/ui |
+| Styling | Tailwind CSS only |
+| State Management | React Server Components + Server Actions (primary) · `zustand` (complex client state only) |
+| Charts | `recharts` (shadcn-compatible) |
+| Decimal Math | `Decimal.js` |
+| Auth Package | `@supabase/ssr` **only** |
+
+---
+
+## 3. Directory Structure
+
+```
+app/
+  (auth)/              # Login / OAuth callback pages
+  (dashboard)/         # Protected routes
+    dashboard/         # Net worth overview
+    accounts/          # Account list & detail
+    transactions/      # Transaction log
+    rewards/           # Points wallet & cap tracker
+components/
+  ui/                  # shadcn/ui originals — DO NOT edit
+  features/            # Domain wrappers around shadcn primitives
+lib/
+  actions/             # All Server Actions (only place DB is touched)
+  supabase/
+    server.ts          # createServerClient helper
+    client.ts          # createBrowserClient helper
+    middleware.ts      # session-refresh middleware client
+  types/
+    database.ts        # Raw Supabase DB types
+    rewards.ts         # RewardRule, SpendStats, RewardBalance types
+    accounts.ts        # Account ViewModels
+    transactions.ts    # Transaction ViewModels
+  utils/
+    currency.ts        # formatCurrency, convertCurrency
+    rewards.ts         # calcReward, checkCapStatus
+docs/
+  progress.md
+  decisions.md
+  architecture/
+  SUPABASE_SCHEMA.md
+```
+
+---
+
+## 4. Database Schema (Authoritative Reference)
+
+> Full DDL, indexes, and RLS policies live in `docs/SUPABASE_SCHEMA.md`.
+> Never invent table or column names — always verify against that file first.
+
+### 4.1 `accounts` — Unified Account Table
+
+Every asset, liability, and investment is a row in this table.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | `gen_random_uuid()` |
+| `user_id` | UUID FK | → `auth.users(id)` |
+| `name` | TEXT | e.g. "Chase Checking", "Amex Gold" |
+| `type` | ENUM | `ASSET` · `LIABILITY` · `SHARE` |
+| `currency` | TEXT | ISO code (e.g. `USD`) — for `SHARE` accounts this is the **ticker** (e.g. `AAPL`, `BTC`) |
+| `balance` | DECIMAL(12,2) | For `ASSET`/`LIABILITY`: fiat amount. For `SHARE`: **number of shares/units held** |
+| `credit_limit` | DECIMAL(12,2) | Credit cards only |
+| `brokerage` | TEXT | Investment accounts only (e.g. `IBKR`, `SCHW`) |
+| `reward_rules` | JSONB | Dynamic cashback/points rules — type: `RewardRule[]` |
+| `reward_balances` | JSONB | Points wallet — type: `Record<string, number>` e.g. `{"AMEX_MR": 75000}` |
+| `spend_stats` | JSONB | O(1) cap tracker — type: `Record<string, number>` e.g. `{"2026_Grocery": 24000}` |
+| `auto_pay_config` | JSONB | Auto-pay settings — type: `AutoPayConfig` |
+| `created_at` | TIMESTAMPTZ | |
+| `updated_at` | TIMESTAMPTZ | |
+
+**`type` semantics:**
+- `ASSET`: positive balance = money you own (checking, savings)
+- `LIABILITY`: negative balance = money you owe (credit card debt). Net worth auto-corrects because summing a negative reduces total.
+- `SHARE`: `balance` = units held; market value is computed at runtime via price API, not stored here
+
+### 4.2 `transactions` — Global Ledger Table
+
+Every movement of fiat or points is a row here.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID PK | |
+| `user_id` | UUID FK | |
+| `type` | ENUM | `EXPENSE` · `INCOME` · `TRANSFER` · `REWARD_EARN` · `REWARD_SPEND` |
+| `amount` | DECIMAL(12,2) | **Always positive** — direction implied by `from_account`/`to_account` |
+| `currency` | TEXT | Fiat (e.g. `USD`) or points currency (e.g. `AMEX_MR`) |
+| `from_account` | UUID FK | Source account (nullable for income) |
+| `to_account` | UUID FK | Destination account (nullable for expense) |
+| `category` | TEXT | Spend category key that triggers the reward engine |
+| `memo` | TEXT | |
+| `transaction_at` | TIMESTAMPTZ | User-specified time |
+| `created_at` | TIMESTAMPTZ | |
+
+---
+
+## 5. Core Business Logic
+
+### 5.1 Net Worth Formula
+
+```
+Net Worth = SUM(account.balance) WHERE user_id = uid AND type IN ('ASSET', 'LIABILITY')
+          + SUM(share.units * currentPrice(share.currency)) WHERE type = 'SHARE'
+```
+
+- `LIABILITY` balances are negative, so they reduce net worth automatically — no special-casing.
+- `SHARE` market values are fetched from the price API at render time and are **never persisted** to the database.
+
+### 5.2 Expense + Reward Engine (must run inside a DB transaction)
+
+```
+1. INSERT transactions (EXPENSE)
+2. UPDATE accounts SET balance = balance - amount WHERE id = card_id
+3. Read card reward_rules JSONB → find matching category rule
+4. Read spend_stats → check against annual/monthly cap
+5. If under cap  → calculate points/cashback earned
+   If over cap   → apply base multiplier (1x) for the overflow portion
+6. INSERT transactions (REWARD_EARN)
+7. UPDATE accounts SET
+     spend_stats   = jsonb_set(spend_stats, ...),
+     reward_balances = jsonb_set(reward_balances, ...)
+   WHERE id = card_id
+8. COMMIT
+```
+
+### 5.3 Transfer / Repayment (must run inside a DB transaction)
+
+```
+1. INSERT transactions (TRANSFER)
+2. UPDATE accounts SET balance = balance - amount WHERE id = from_account   -- e.g. Checking decreases
+3. UPDATE accounts SET balance = balance + amount WHERE id = to_account     -- e.g. credit card debt decreases
+4. COMMIT
+-- Net worth is unchanged: +asset delta cancels -liability delta
+```
+
+### 5.4 Reward Redemption
+
+```
+1. INSERT transactions (REWARD_SPEND, currency = points currency)
+2. UPDATE accounts SET reward_balances = jsonb_set(...) WHERE id = card_id
+```
+
+---
+
+## 6. Data Layer Rules
+
+- **All DB operations live in `/lib/actions/`** as Server Actions. Components never import or call the Supabase client directly.
+- **All write operations** (expense recording, repayment, reward earn) must be wrapped in a Supabase database transaction to prevent partial state.
+- **Decimal math**: never use `parseFloat` or native JS arithmetic on money values. Use `Decimal.js` for all financial calculations.
+- **Amount storage**: `DECIMAL(12,2)` in PostgreSQL; `number` in TypeScript ViewModel (after safe conversion via `Decimal.js`).
+- **Display formatting**: always use `Intl.NumberFormat` — never hand-roll currency strings.
+- **SHARE market value**: fetch from price API (e.g. Polygon.io / Alpha Vantage) in a Server Component at render time. Never persist live prices to DB.
+- **JSONB schemas** must map to explicit TypeScript types defined in `/lib/types/`:
+  - `reward_rules` → `RewardRule[]` (defined in `rewards.ts`)
+  - `reward_balances` → `Record<string, number>`
+  - `spend_stats` → `Record<string, number>`
+  - `auto_pay_config` → `AutoPayConfig`
+
+---
+
+## 7. TypeScript Conventions
+
+### No `any` — ever
+
+Use `unknown` + type guards when the shape is uncertain.
+
+### Server Action return type (mandatory)
+
+```ts
+type ActionResult<T> =
+  | { success: true; data: T }
+  | { success: false; error: string }
+```
+
+Every Server Action must return this shape. No throwing raw errors to the client.
+
+### Type file layout
+
+```
+/lib/types/database.ts     — raw Supabase-generated DB row types
+/lib/types/accounts.ts     — AccountViewModel, ShareAccountViewModel
+/lib/types/transactions.ts — TransactionViewModel
+/lib/types/rewards.ts      — RewardRule, SpendStats, AutoPayConfig
+```
+
+Do not mix DB types and ViewModels in the same file.
+
+### Naming
+
+| Artifact | Convention | Example |
+|---|---|---|
+| Component files | `PascalCase.tsx` | `NetWorthCard.tsx` |
+| Server Actions | `camelCase.ts` | `createExpense.ts` |
+| Utility functions | `camelCase` | `calcReward`, `formatCurrency` |
+| DB table names | `snake_case` | `accounts`, `transactions` |
+| JSONB key names | `snake_case` | `spend_stats`, `reward_balances` |
+
+---
+
+## 8. Supabase Auth Rules (Critical — Read Before Writing Any Auth Code)
+
+### Only one package is permitted
+
+```ts
+// ✅ Only allowed import
+import { createServerClient, createBrowserClient } from '@supabase/ssr'
+
+// ❌ Banned — deprecated, will throw runtime errors
+import { ... } from '@supabase/auth-helpers-nextjs'
+```
+
+### Cookie API: only `getAll` / `setAll`
+
+```ts
+// ✅ Correct
+createServerClient(url, key, {
+  cookies: {
+    getAll()                { return cookieStore.getAll() },
+    setAll(cookiesToSet)    {
+      cookiesToSet.forEach(({ name, value, options }) =>
+        cookieStore.set(name, value, options)
+      )
+    },
+  },
+})
+
+// ❌ Banned — old API, removed in current @supabase/ssr
+cookies: { get, set, remove }
+```
+
+### Client usage by context
+
+| Context | Client factory |
+|---|---|
+| Server Component / Server Action | `createServerClient` + `cookies()` from `next/headers` |
+| Client Component | `createBrowserClient` |
+| Middleware (`middleware.ts`) | `createServerClient` + `request`/`response` cookies |
+
+### Auth validation rules
+
+- **Always use `getUser()`** to verify identity inside Server Actions.
+- **Never use `getSession()`** for authorization — it does not verify the JWT and can be spoofed.
+- **Middleware must call `supabase.auth.getUser()`** on every request to refresh the session token. Without this, sessions silently expire.
+- All DB tables have RLS enabled. The `user_id` column must always equal `auth.uid()`.
+
+---
+
+## 9. Frontend Rules
+
+### Component authoring
+
+- **Never hand-write base UI components.** Install via `npx shadcn add <component>`.
+- **Never edit files in `components/ui/`.** To customize, wrap in `components/features/`.
+- **Never write custom CSS.** Use Tailwind utility classes exclusively.
+
+### State management priority
+
+1. React Server Components + Server Actions (default)
+2. `useOptimistic` for optimistic UI updates (no third-party lib)
+3. `zustand` only for complex, cross-component client state
+
+### Charts
+
+All charts use `recharts`. No other charting library.
+
+### Multi-currency display
+
+- Always pass raw `number` (in base currency) + `currencyCode` string to `formatCurrency`.
+- Exchange rate conversion happens in a Server Action, never in render logic.
+
+---
+
+## 10. Anti-Hallucination Rules (Agent Constraints)
+
+### Before importing any package
+
+1. Open `package.json` and confirm the package is listed.
+2. If it is not installed, **stop and tell the user** — provide the install command. Do not write the import and proceed.
+3. For shadcn components, run `npx shadcn add <component>` first — never assume a component file exists.
+
+### After completing each sub-task
+
+```bash
+git diff --stat   # confirm scope of changes
+git diff          # verify no unintended files were modified
+```
+
+- Never mix unrelated file changes into a single commit.
+- If `git diff` shows edits to `components/ui/`, revert immediately — those files are off-limits.
+
+### Type-check before every commit
+
+```bash
+npx tsc --noEmit
+```
+
+No type errors may be introduced. Fix before committing.
+
+### Never invent schema
+
+Always verify column names, table names, and JSONB key names against `docs/SUPABASE_SCHEMA.md` before writing any query or Server Action. If the schema file and your assumption conflict, the schema file wins.
+
+---
+
+## 11. Prohibited Patterns
+
+| Rule | Reason |
+|---|---|
+| ❌ No `any` type | Type safety is non-negotiable |
+| ❌ No `parseFloat` on money | Floating-point precision errors in financial data |
+| ❌ No direct Supabase calls in components | Exposes DB permissions to the client |
+| ❌ No API Routes for business logic | Use Server Actions |
+| ❌ No `@supabase/auth-helpers-nextjs` | Deprecated, causes runtime errors |
+| ❌ No single `get`/`set`/`remove` cookie API | Removed in current `@supabase/ssr` |
+| ❌ No `getSession()` for auth checks | Does not verify JWT |
+| ❌ No persisting live market prices | SHARE account value is always computed at runtime |
+| ❌ No custom CSS | Tailwind only |
+| ❌ No editing `components/ui/` | Wrap in `components/features/` instead |
+| ❌ No write operations outside a DB transaction | Partial state causes data corruption |
+
+---
+
+## 12. Document Index (4 Core Files)
+
+> Principle: minimum files, maximum context. Do not create additional doc files without a clear reason.
+
+| File | Purpose |
+|---|---|
+| `.cursorrules` | Tech stack, conventions, business logic, hard rules (this file) |
+| `docs/progress.md` | Current dev status, known bugs, **User Stories** (no separate `story.md` needed) |
+| `docs/architecture/[feature].md` | Deep-dive design for a specific feature (e.g. `rewards.md`, `investments.md`) |
+| `docs/decisions.md` | Architecture Decision Records (ADR format) — what was decided and why |
+| `docs/SUPABASE_SCHEMA.md` | **Authoritative** DDL for all tables, indexes, RLS policies, RPC functions |
+
+User Stories are written directly inside `progress.md` under `## Story: <name>` headings.
+`docs/architecture/database.md` is superseded by `docs/SUPABASE_SCHEMA.md` for schema details;
+keep only relationship diagrams and design rationale in the architecture file.
+
+---
+
+## 13. Development Phases (Reference)
+
+| Phase | Scope |
+|---|---|
+| **Phase 1 — Local MVP** | Supabase local Docker · Next.js scaffold · Google OAuth · Dashboard + "Add Transaction" form · Reward engine core |
+| **Phase 2 — Cloud Deploy** | Supabase Cloud · Vercel + GitHub CI · Custom domain |
+| **Phase 3 — Automation & Investments** | Auto-pay Cron job · SHARE account type · Price API integration (Polygon.io / Alpha Vantage) · Real-time net worth with live market values |

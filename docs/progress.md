@@ -36,6 +36,12 @@
 - [x] `.env.local` template created (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`)
 - [x] Node.js v20.20.1 installed via nvm (`.zshrc` configured)
 
+### Database Schema & Types (2026-03-15)
+
+- [x] `supabase/migrations/001_init.sql` — accounts + transactions tables, ENUM types, indexes, `updated_at` trigger, RLS policies
+- [x] `lib/types/database.ts` — `Json`, `Database` namespace (`Row`/`Insert`/`Update` per table), `AccountRow`/`TransactionRow` convenience aliases
+- [x] `docs/architecture/accounts.md` — Account management MVP architecture (types, Server Actions, component tree, key decisions)
+
 ## Not Yet Done
 
 - [ ] Supabase local Docker setup
@@ -44,8 +50,8 @@
 - [ ] Google OAuth configuration
 - [ ] App Router route groups: `(auth)/`, `(dashboard)/`
 - [ ] Route pages: `dashboard/`, `accounts/`, `transactions/`, `rewards/`
-- [ ] Database schema (`docs/SUPABASE_SCHEMA.md`)
-- [ ] Type definitions (fill in the empty skeleton files)
+- [ ] `docs/SUPABASE_SCHEMA.md` (authoritative DDL reference, can now be derived from 001_init.sql)
+- [ ] Type definitions: fill in `lib/types/accounts.ts`, `lib/types/transactions.ts`, `lib/types/rewards.ts`
 - [ ] Server Actions in `lib/actions/`
 - [ ] Feature components in `components/features/`
 - [ ] `docs/decisions.md` (ADR log)
